@@ -1,0 +1,429 @@
+name: TestFlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character private source commit
+        required: true
+      build_number:
+        description: App Store Connect build number, greater than every prior Lexis build
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lexis-testflight
+  cancel-in-progress: false
+
+jobs:
+  archive-and-upload:
+    runs-on: xcode-27
+    timeout-minutes: 50
+
+    steps:
+      - name: Validate release inputs
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]]
+
+      - name: Check out private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: notzenco/lexis-apple
+          ref: ${{ inputs.source_sha }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+          show-progress: false
+
+      - name: Verify private source revision
+        working-directory: source
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
+          test -f project.yml
+
+      - name: Validate release configuration
+        shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APP_GROUP_ID: ${{ vars.APP_GROUP_ID }}
+          IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+          IOS_WIDGET_BUNDLE_ID: ${{ vars.IOS_WIDGET_BUNDLE_ID }}
+          WATCH_BUNDLE_ID: ${{ vars.WATCH_BUNDLE_ID }}
+          WATCH_WIDGET_BUNDLE_ID: ${{ vars.WATCH_WIDGET_BUNDLE_ID }}
+          LEXIS_CATALOG_PUBLIC_KEY: ${{ vars.LEXIS_CATALOG_PUBLIC_KEY }}
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          IOS_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE }}
+          IOS_WIDGET_PROVISIONING_PROFILE: ${{ secrets.IOS_WIDGET_PROVISIONING_PROFILE }}
+          WATCH_PROVISIONING_PROFILE: ${{ secrets.WATCH_PROVISIONING_PROFILE }}
+          WATCH_WIDGET_PROVISIONING_PROFILE: ${{ secrets.WATCH_WIDGET_PROVISIONING_PROFILE }}
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          required=(
+            APPLE_TEAM_ID APP_GROUP_ID IOS_BUNDLE_ID IOS_WIDGET_BUNDLE_ID
+            WATCH_BUNDLE_ID WATCH_WIDGET_BUNDLE_ID LEXIS_CATALOG_PUBLIC_KEY
+            APPLE_CERTIFICATE_P12 APPLE_CERTIFICATE_PASSWORD
+            IOS_PROVISIONING_PROFILE IOS_WIDGET_PROVISIONING_PROFILE
+            WATCH_PROVISIONING_PROFILE WATCH_WIDGET_PROVISIONING_PROFILE
+            APP_STORE_CONNECT_API_KEY APP_STORE_CONNECT_API_KEY_ID
+            APP_STORE_CONNECT_ISSUER_ID
+          )
+          for name in "${required[@]}"; do
+            test -n "${!name:-}" || {
+              echo "::error::Missing release variable or secret: $name"
+              exit 1
+            }
+          done
+
+      - name: Validate supported Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          developer_dir="$(xcode-select -p)"
+          case "$developer_dir" in
+            *Xcode_27_beta_1.app/*|*Xcode_27_beta_2.app/*|*Xcode_27_beta_3.app/*)
+              echo "::error::App Store Connect no longer accepts this Xcode image."
+              exit 1
+              ;;
+            *Xcode_27*) ;;
+            *)
+              echo "::error::Expected an Xcode 27 runner."
+              exit 1
+              ;;
+          esac
+
+      - name: Install pinned XcodeGen
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --silent --show-error \
+            --output /tmp/xcodegen.zip \
+            https://github.com/yonaskolb/XcodeGen/releases/download/2.45.4/xcodegen.zip
+          echo '090ec29491aad50aec10631bf6e62253fed733c50f3aab0f5ffc86bc170bdbef  /tmp/xcodegen.zip' \
+            | shasum -a 256 --check
+          unzip -q /tmp/xcodegen.zip -d /tmp
+          sudo /tmp/xcodegen/install.sh
+          xcodegen --version
+
+      - name: Install signing identity and profiles
+        shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APP_GROUP_ID: ${{ vars.APP_GROUP_ID }}
+          IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+          IOS_WIDGET_BUNDLE_ID: ${{ vars.IOS_WIDGET_BUNDLE_ID }}
+          WATCH_BUNDLE_ID: ${{ vars.WATCH_BUNDLE_ID }}
+          WATCH_WIDGET_BUNDLE_ID: ${{ vars.WATCH_WIDGET_BUNDLE_ID }}
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          IOS_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE }}
+          IOS_WIDGET_PROVISIONING_PROFILE: ${{ secrets.IOS_WIDGET_PROVISIONING_PROFILE }}
+          WATCH_PROVISIONING_PROFILE: ${{ secrets.WATCH_PROVISIONING_PROFILE }}
+          WATCH_WIDGET_PROVISIONING_PROFILE: ${{ secrets.WATCH_WIDGET_PROVISIONING_PROFILE }}
+        run: |
+          set -euo pipefail
+          keychain_path="$RUNNER_TEMP/build.keychain-db"
+          keychain_password="$(uuidgen)"
+          profiles_path="$HOME/Library/MobileDevice/Provisioning Profiles"
+
+          printf '%s' "$APPLE_CERTIFICATE_P12" | base64 -D \
+            > "$RUNNER_TEMP/distribution.p12"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$RUNNER_TEMP/distribution.p12" \
+            -k "$keychain_path" -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$keychain_password" "$keychain_path" >/dev/null
+          security list-keychains -d user -s "$keychain_path"
+          security find-identity -v -p codesigning "$keychain_path" \
+            | grep -q '1 valid identities found'
+          mkdir -p "$profiles_path"
+
+          install_profile() {
+            local encoded="$1"
+            local expected_bundle="$2"
+            local exported_name="$3"
+            local require_icloud="$4"
+            local index="$5"
+            local profile="$RUNNER_TEMP/profile-$index.mobileprovision"
+            local plist="$RUNNER_TEMP/profile-$index.plist"
+            printf '%s' "$encoded" | base64 -D > "$profile"
+            security cms -D -i "$profile" > "$plist"
+
+            local uuid name application_identifier get_task_allow
+            uuid="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$plist")"
+            name="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$plist")"
+            application_identifier="$(/usr/libexec/PlistBuddy \
+              -c 'Print :Entitlements:application-identifier' "$plist")"
+            get_task_allow="$(/usr/libexec/PlistBuddy \
+              -c 'Print :Entitlements:get-task-allow' "$plist")"
+            [[ "$application_identifier" == "$APPLE_TEAM_ID.$expected_bundle" ]]
+            [[ "$get_task_allow" == "false" ]]
+            if /usr/libexec/PlistBuddy -c 'Print :ProvisionedDevices' \
+              "$plist" >/dev/null 2>&1; then
+              echo "::error::Expected an App Store distribution profile."
+              return 1
+            fi
+            python3 -c \
+              'import datetime,plistlib,sys; p=plistlib.load(open(sys.argv[1], "rb")); assert p["ExpirationDate"] > datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)' \
+              "$plist"
+            /usr/libexec/PlistBuddy \
+              -c 'Print :Entitlements:com.apple.security.application-groups' \
+              "$plist" | grep -Fq "$APP_GROUP_ID"
+
+            if [[ "$require_icloud" == "true" ]]; then
+              local kvstore
+              kvstore="$(/usr/libexec/PlistBuddy \
+                -c 'Print :Entitlements:com.apple.developer.ubiquity-kvstore-identifier' \
+                "$plist")"
+              [[ "$kvstore" == "$APPLE_TEAM_ID.$expected_bundle" \
+                || "$kvstore" == "$APPLE_TEAM_ID.*" ]]
+            else
+              if /usr/libexec/PlistBuddy \
+                -c 'Print :Entitlements:com.apple.developer.ubiquity-kvstore-identifier' \
+                "$plist" >/dev/null 2>&1; then
+                echo "::error::iCloud entitlement leaked into a non-iPhone profile."
+                return 1
+              fi
+            fi
+
+            cp "$profile" "$profiles_path/$uuid.mobileprovision"
+            echo "$exported_name=$name" >> "$GITHUB_ENV"
+          }
+
+          install_profile "$IOS_PROVISIONING_PROFILE" \
+            "$IOS_BUNDLE_ID" IOS_PROFILE_NAME true 0
+          install_profile "$IOS_WIDGET_PROVISIONING_PROFILE" \
+            "$IOS_WIDGET_BUNDLE_ID" IOS_WIDGET_PROFILE_NAME false 1
+          install_profile "$WATCH_PROVISIONING_PROFILE" \
+            "$WATCH_BUNDLE_ID" WATCH_PROFILE_NAME false 2
+          install_profile "$WATCH_WIDGET_PROVISIONING_PROFILE" \
+            "$WATCH_WIDGET_BUNDLE_ID" WATCH_WIDGET_PROFILE_NAME false 3
+
+      - name: Generate, archive, and verify private source
+        id: release
+        continue-on-error: true
+        working-directory: source
+        shell: bash
+        env:
+          BUILD_NUMBER: ${{ inputs.build_number }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APP_GROUP_ID: ${{ vars.APP_GROUP_ID }}
+          IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+          IOS_WIDGET_BUNDLE_ID: ${{ vars.IOS_WIDGET_BUNDLE_ID }}
+          WATCH_BUNDLE_ID: ${{ vars.WATCH_BUNDLE_ID }}
+          WATCH_WIDGET_BUNDLE_ID: ${{ vars.WATCH_WIDGET_BUNDLE_ID }}
+          LEXIS_CATALOG_PUBLIC_KEY: ${{ vars.LEXIS_CATALOG_PUBLIC_KEY }}
+        run: |
+          set -uo pipefail
+          release_log="$RUNNER_TEMP/private-release.log"
+          if ! {
+            [[ "$(git rev-parse HEAD)" == "${{ inputs.source_sha }}" ]]
+            xcodegen generate
+            xcodebuild -project LexisApple.xcodeproj -scheme Lexis \
+              -configuration Release -destination 'generic/platform=iOS' \
+              -archivePath "$RUNNER_TEMP/Lexis.xcarchive" \
+              CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+              LEXIS_CATALOG_PUBLIC_KEY="$LEXIS_CATALOG_PUBLIC_KEY" \
+              CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY='Apple Distribution' \
+              DEVELOPMENT_TEAM="$APPLE_TEAM_ID" clean archive -quiet
+
+            iphone_app="$RUNNER_TEMP/Lexis.xcarchive/Products/Applications/Lexis.app"
+            watch_app="$iphone_app/Watch/LexisWatch.app"
+            iphone_widget="$iphone_app/PlugIns/LexisWidgets.appex"
+            watch_widget="$watch_app/PlugIns/LexisWatchWidgets.appex"
+
+            verify_target() {
+              local bundle_path="$1"
+              local expected_bundle="$2"
+              local require_icloud="$3"
+              local index="$4"
+              local entitlements="$RUNNER_TEMP/signed-$index.plist"
+              local profile="$RUNNER_TEMP/embedded-$index.plist"
+              test -d "$bundle_path"
+              [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+                "$bundle_path/Info.plist")" == "$expected_bundle" ]]
+              [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' \
+                "$bundle_path/Info.plist")" == "$BUILD_NUMBER" ]]
+              codesign --verify --deep --strict "$bundle_path"
+              codesign -d --entitlements :- "$bundle_path" > "$entitlements"
+              security cms -D -i "$bundle_path/embedded.mobileprovision" \
+                > "$profile"
+              [[ "$(/usr/libexec/PlistBuddy \
+                -c 'Print :application-identifier' "$entitlements")" \
+                == "$APPLE_TEAM_ID.$expected_bundle" ]]
+              [[ "$(/usr/libexec/PlistBuddy \
+                -c 'Print :Entitlements:application-identifier' "$profile")" \
+                == "$APPLE_TEAM_ID.$expected_bundle" ]]
+              /usr/libexec/PlistBuddy \
+                -c 'Print :com.apple.security.application-groups' \
+                "$entitlements" | grep -Fq "$APP_GROUP_ID"
+              /usr/libexec/PlistBuddy \
+                -c 'Print :Entitlements:com.apple.security.application-groups' \
+                "$profile" | grep -Fq "$APP_GROUP_ID"
+
+              if [[ "$require_icloud" == "true" ]]; then
+                /usr/libexec/PlistBuddy \
+                  -c 'Print :com.apple.developer.ubiquity-kvstore-identifier' \
+                  "$entitlements" >/dev/null
+                /usr/libexec/PlistBuddy \
+                  -c 'Print :Entitlements:com.apple.developer.ubiquity-kvstore-identifier' \
+                  "$profile" >/dev/null
+              else
+                ! /usr/libexec/PlistBuddy \
+                  -c 'Print :com.apple.developer.ubiquity-kvstore-identifier' \
+                  "$entitlements" >/dev/null 2>&1
+                ! /usr/libexec/PlistBuddy \
+                  -c 'Print :Entitlements:com.apple.developer.ubiquity-kvstore-identifier' \
+                  "$profile" >/dev/null 2>&1
+              fi
+            }
+
+            verify_target "$iphone_app" "$IOS_BUNDLE_ID" true 0
+            verify_target "$iphone_widget" "$IOS_WIDGET_BUNDLE_ID" false 1
+            verify_target "$watch_app" "$WATCH_BUNDLE_ID" false 2
+            verify_target "$watch_widget" "$WATCH_WIDGET_BUNDLE_ID" false 3
+            [[ "$(/usr/libexec/PlistBuddy -c 'Print :LexisCatalogPublicKey' \
+              "$iphone_app/Info.plist")" == "$LEXIS_CATALOG_PUBLIC_KEY" ]]
+          } >"$release_log" 2>&1; then
+            echo "::error::The private release build failed. Diagnostics are suppressed here."
+            exit 1
+          fi
+
+      - name: Export archive
+        if: steps.release.outcome == 'success'
+        id: export
+        continue-on-error: true
+        shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+          IOS_WIDGET_BUNDLE_ID: ${{ vars.IOS_WIDGET_BUNDLE_ID }}
+          WATCH_BUNDLE_ID: ${{ vars.WATCH_BUNDLE_ID }}
+          WATCH_WIDGET_BUNDLE_ID: ${{ vars.WATCH_WIDGET_BUNDLE_ID }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>destination</key><string>export</string>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+            <key>method</key><string>app-store-connect</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>stripSwiftSymbols</key><true/>
+            <key>teamID</key><string>$APPLE_TEAM_ID</string>
+            <key>uploadSymbols</key><true/>
+            <key>provisioningProfiles</key><dict>
+              <key>$IOS_BUNDLE_ID</key><string>$IOS_PROFILE_NAME</string>
+              <key>$IOS_WIDGET_BUNDLE_ID</key><string>$IOS_WIDGET_PROFILE_NAME</string>
+              <key>$WATCH_BUNDLE_ID</key><string>$WATCH_PROFILE_NAME</string>
+              <key>$WATCH_WIDGET_BUNDLE_ID</key><string>$WATCH_WIDGET_PROFILE_NAME</string>
+            </dict>
+          </dict></plist>
+          PLIST
+          if ! xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Lexis.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -quiet >>"$RUNNER_TEMP/private-release.log" 2>&1; then
+            echo "::error::The private archive export failed. Diagnostics are suppressed here."
+            exit 1
+          fi
+
+      - name: Upload to App Store Connect
+        if: steps.release.outcome == 'success' && steps.export.outcome == 'success'
+        id: upload
+        continue-on-error: true
+        shell: bash
+        env:
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.private_keys"
+          auth_key="$HOME/.private_keys/AuthKey_${APP_STORE_CONNECT_API_KEY_ID}.p8"
+          printf '%s' "$APP_STORE_CONNECT_API_KEY" > "$auth_key"
+          chmod 600 "$auth_key"
+          ipa_path="$(find "$RUNNER_TEMP/export" -maxdepth 1 \
+            -type f -name '*.ipa' -print -quit)"
+          test -n "$ipa_path"
+          if ! xcrun altool --upload-app --type ios --file "$ipa_path" \
+            --apiKey "$APP_STORE_CONNECT_API_KEY_ID" \
+            --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID" \
+            >>"$RUNNER_TEMP/private-release.log" 2>&1; then
+            echo "::error::The private App Store Connect upload failed. Diagnostics are suppressed here."
+            exit 1
+          fi
+
+      - name: Encrypt private release diagnostics
+        if: steps.release.outcome == 'failure' || steps.export.outcome == 'failure' || steps.upload.outcome == 'failure'
+        shell: bash
+        env:
+          DIAGNOSTIC_PUBLIC_KEY: ${{ secrets.DIAGNOSTIC_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$DIAGNOSTIC_PUBLIC_KEY" > "$RUNNER_TEMP/diagnostic-public.pem"
+          openssl rand -hex 32 > "$RUNNER_TEMP/diagnostic-key.hex"
+          openssl enc -aes-256-cbc -salt -pbkdf2 \
+            -in "$RUNNER_TEMP/private-release.log" \
+            -out "$RUNNER_TEMP/private-release.log.enc" \
+            -pass file:"$RUNNER_TEMP/diagnostic-key.hex"
+          openssl pkeyutl -encrypt -pubin \
+            -inkey "$RUNNER_TEMP/diagnostic-public.pem" \
+            -in "$RUNNER_TEMP/diagnostic-key.hex" \
+            -out "$RUNNER_TEMP/diagnostic-key.enc" \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          rm -f "$RUNNER_TEMP/diagnostic-key.hex" \
+            "$RUNNER_TEMP/diagnostic-public.pem" \
+            "$RUNNER_TEMP/private-release.log"
+
+      - name: Upload encrypted release diagnostics
+        if: steps.release.outcome == 'failure' || steps.export.outcome == 'failure' || steps.upload.outcome == 'failure'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: encrypted-private-release-diagnostics
+          path: |
+            ${{ runner.temp }}/private-release.log.enc
+            ${{ runner.temp }}/diagnostic-key.enc
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove signing material and diagnostics
+        if: always()
+        shell: bash
+        env:
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+        run: |
+          security delete-keychain "$RUNNER_TEMP/build.keychain-db" 2>/dev/null || true
+          rm -f "$HOME/.private_keys/AuthKey_${APP_STORE_CONNECT_API_KEY_ID}.p8"
+          rm -rf "$RUNNER_TEMP"/*.p12 \
+            "$RUNNER_TEMP"/*.mobileprovision \
+            "$RUNNER_TEMP"/profile-*.plist \
+            "$RUNNER_TEMP"/embedded-*.plist \
+            "$RUNNER_TEMP"/signed-*.plist \
+            "$RUNNER_TEMP/private-release.log"
+
+      - name: Report private release failure
+        if: steps.release.outcome == 'failure' || steps.export.outcome == 'failure' || steps.upload.outcome == 'failure'
+        run: exit 1

@@ -1,0 +1,187 @@
+name: Private source build
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character private source commit
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 35
+
+    steps:
+      - name: Validate source revision
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+
+      - name: Check out private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: notzenco/lexis-apple
+          ref: ${{ inputs.source_sha }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+          show-progress: false
+
+      - name: Verify private source revision
+        working-directory: source
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
+          test -f project.yml
+          test -f Shared/Resources/lexis-catalog-v1.json
+
+      - name: Validate build configuration
+        shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APP_GROUP_ID: ${{ vars.APP_GROUP_ID }}
+          IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+          IOS_WIDGET_BUNDLE_ID: ${{ vars.IOS_WIDGET_BUNDLE_ID }}
+          WATCH_BUNDLE_ID: ${{ vars.WATCH_BUNDLE_ID }}
+          WATCH_WIDGET_BUNDLE_ID: ${{ vars.WATCH_WIDGET_BUNDLE_ID }}
+          LEXIS_CATALOG_PUBLIC_KEY: ${{ vars.LEXIS_CATALOG_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          required=(
+            APPLE_TEAM_ID APP_GROUP_ID IOS_BUNDLE_ID IOS_WIDGET_BUNDLE_ID
+            WATCH_BUNDLE_ID WATCH_WIDGET_BUNDLE_ID LEXIS_CATALOG_PUBLIC_KEY
+          )
+          for name in "${required[@]}"; do
+            test -n "${!name:-}" || {
+              echo "::error::Missing build repository variable: $name"
+              exit 1
+            }
+          done
+
+      - name: Validate supported Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          developer_dir="$(xcode-select -p)"
+          case "$developer_dir" in
+            *Xcode_27_beta_1.app/*|*Xcode_27_beta_2.app/*|*Xcode_27_beta_3.app/*)
+              echo "::error::App Store Connect no longer accepts this Xcode image."
+              exit 1
+              ;;
+            *Xcode_27*) ;;
+            *)
+              echo "::error::Expected an Xcode 27 runner."
+              exit 1
+              ;;
+          esac
+
+      - name: Install pinned XcodeGen
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --silent --show-error \
+            --output /tmp/xcodegen.zip \
+            https://github.com/yonaskolb/XcodeGen/releases/download/2.45.4/xcodegen.zip
+          echo '090ec29491aad50aec10631bf6e62253fed733c50f3aab0f5ffc86bc170bdbef  /tmp/xcodegen.zip' \
+            | shasum -a 256 --check
+          unzip -q /tmp/xcodegen.zip -d /tmp
+          sudo /tmp/xcodegen/install.sh
+          xcodegen --version
+
+      - name: Build private source without signing
+        id: build
+        continue-on-error: true
+        working-directory: source
+        shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APP_GROUP_ID: ${{ vars.APP_GROUP_ID }}
+          IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+          IOS_WIDGET_BUNDLE_ID: ${{ vars.IOS_WIDGET_BUNDLE_ID }}
+          WATCH_BUNDLE_ID: ${{ vars.WATCH_BUNDLE_ID }}
+          WATCH_WIDGET_BUNDLE_ID: ${{ vars.WATCH_WIDGET_BUNDLE_ID }}
+          IOS_PROFILE_NAME: UNSIGNED
+          IOS_WIDGET_PROFILE_NAME: UNSIGNED
+          WATCH_PROFILE_NAME: UNSIGNED
+          WATCH_WIDGET_PROFILE_NAME: UNSIGNED
+          LEXIS_CATALOG_PUBLIC_KEY: ${{ vars.LEXIS_CATALOG_PUBLIC_KEY }}
+        run: |
+          set -uo pipefail
+          build_log="$RUNNER_TEMP/private-build.log"
+          failed=0
+          [[ "$(git rev-parse HEAD)" == "${{ inputs.source_sha }}" ]] || failed=1
+          node tools/validate-catalog.mjs >>"$build_log" 2>&1 || failed=1
+          node tools/catalog-report.mjs >>"$build_log" 2>&1 || failed=1
+          xcodegen generate >>"$build_log" 2>&1 || failed=1
+          xcodebuild -project LexisApple.xcodeproj -scheme LexisTests \
+            -sdk macosx -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO clean test >>"$build_log" 2>&1 || failed=1
+          xcodebuild -project LexisApple.xcodeproj -scheme Lexis \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO clean build >>"$build_log" 2>&1 || failed=1
+          xcodebuild -project LexisApple.xcodeproj -scheme LexisWatch \
+            -destination 'generic/platform=watchOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO clean build >>"$build_log" 2>&1 || failed=1
+          xcodebuild -project LexisApple.xcodeproj -scheme LexisWidgets \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO clean build >>"$build_log" 2>&1 || failed=1
+          xcodebuild -project LexisApple.xcodeproj -scheme LexisWatchWidgets \
+            -destination 'generic/platform=watchOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO clean build >>"$build_log" 2>&1 || failed=1
+          if [[ "$failed" != 0 ]]; then
+            echo "::error::The private source build failed. Diagnostics are suppressed here."
+            exit 1
+          fi
+          echo "Private source build succeeded."
+
+      - name: Encrypt private diagnostics
+        if: steps.build.outcome == 'failure'
+        shell: bash
+        env:
+          DIAGNOSTIC_PUBLIC_KEY: ${{ secrets.DIAGNOSTIC_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$DIAGNOSTIC_PUBLIC_KEY" > "$RUNNER_TEMP/diagnostic-public.pem"
+          openssl rand -hex 32 > "$RUNNER_TEMP/diagnostic-key.hex"
+          openssl enc -aes-256-cbc -salt -pbkdf2 \
+            -in "$RUNNER_TEMP/private-build.log" \
+            -out "$RUNNER_TEMP/private-build.log.enc" \
+            -pass file:"$RUNNER_TEMP/diagnostic-key.hex"
+          openssl pkeyutl -encrypt -pubin \
+            -inkey "$RUNNER_TEMP/diagnostic-public.pem" \
+            -in "$RUNNER_TEMP/diagnostic-key.hex" \
+            -out "$RUNNER_TEMP/diagnostic-key.enc" \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          rm -f "$RUNNER_TEMP/diagnostic-key.hex" \
+            "$RUNNER_TEMP/diagnostic-public.pem" \
+            "$RUNNER_TEMP/private-build.log"
+
+      - name: Upload encrypted diagnostics
+        if: steps.build.outcome == 'failure'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: encrypted-private-build-diagnostics
+          path: |
+            ${{ runner.temp }}/private-build.log.enc
+            ${{ runner.temp }}/diagnostic-key.enc
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove private diagnostics
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/private-build.log"
+
+      - name: Report private build failure
+        if: steps.build.outcome == 'failure'
+        run: exit 1

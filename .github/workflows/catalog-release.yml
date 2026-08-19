@@ -1,0 +1,166 @@
+name: Catalog release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character private source commit
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lexis-catalog-release
+  cancel-in-progress: false
+
+jobs:
+  sign-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CATALOG_TAG: catalog-current
+      CATALOG_ASSET_URL: https://github.com/notzenco/lexis-apple-build/releases/download/catalog-current/lexis-catalog.json
+
+    steps:
+      - name: Validate source revision
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+
+      - name: Check out private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: notzenco/lexis-apple
+          ref: ${{ inputs.source_sha }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+          show-progress: false
+
+      - name: Verify private source revision
+        working-directory: source
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
+          test -f Shared/Resources/lexis-catalog-v1.json
+
+      - name: Validate signing configuration
+        shell: bash
+        env:
+          LEXIS_CATALOG_SIGNING_PRIVATE_KEY: ${{ secrets.LEXIS_CATALOG_SIGNING_PRIVATE_KEY }}
+        run: |
+          test -n "$LEXIS_CATALOG_SIGNING_PRIVATE_KEY" || {
+            echo "::error::Missing catalog signing key."
+            exit 1
+          }
+
+      - name: Prepare signed catalog assets
+        id: prepare
+        continue-on-error: true
+        working-directory: source
+        shell: bash
+        env:
+          LEXIS_CATALOG_SIGNING_PRIVATE_KEY: ${{ secrets.LEXIS_CATALOG_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -uo pipefail
+          catalog_log="$RUNNER_TEMP/private-catalog.log"
+          if ! {
+            node tools/validate-catalog.mjs
+            node tools/catalog-report.mjs > "$RUNNER_TEMP/lexis-catalog-report.json"
+            cp Shared/Resources/lexis-catalog-v1.json \
+              "$RUNNER_TEMP/lexis-catalog.json"
+            node tools/sign-catalog.mjs \
+              "$RUNNER_TEMP/lexis-catalog.json" \
+              "$CATALOG_ASSET_URL" \
+              "$RUNNER_TEMP/lexis-catalog-manifest.json"
+          } >"$catalog_log" 2>&1; then
+            echo "::error::The private catalog build failed. Diagnostics are suppressed here."
+            exit 1
+          fi
+
+      - name: Publish stable catalog assets
+        if: steps.prepare.outcome == 'success'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$CATALOG_TAG" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$CATALOG_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Lexis Catalog" \
+              --notes "Signed offline catalog assets consumed by released Lexis clients."
+          fi
+          gh release upload "$CATALOG_TAG" \
+            "$RUNNER_TEMP/lexis-catalog.json" \
+            "$RUNNER_TEMP/lexis-catalog-manifest.json" \
+            "$RUNNER_TEMP/lexis-catalog-report.json" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+      - name: Verify published assets
+        if: steps.prepare.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --silent --show-error \
+            "$CATALOG_ASSET_URL" \
+            --output "$RUNNER_TEMP/published-catalog.json"
+          curl --fail --location --silent --show-error \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${CATALOG_TAG}/lexis-catalog-manifest.json" \
+            --output "$RUNNER_TEMP/published-manifest.json"
+          cmp "$RUNNER_TEMP/lexis-catalog.json" \
+            "$RUNNER_TEMP/published-catalog.json"
+          cmp "$RUNNER_TEMP/lexis-catalog-manifest.json" \
+            "$RUNNER_TEMP/published-manifest.json"
+
+      - name: Encrypt private catalog diagnostics
+        if: steps.prepare.outcome == 'failure'
+        shell: bash
+        env:
+          DIAGNOSTIC_PUBLIC_KEY: ${{ secrets.DIAGNOSTIC_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$DIAGNOSTIC_PUBLIC_KEY" > "$RUNNER_TEMP/diagnostic-public.pem"
+          openssl rand -hex 32 > "$RUNNER_TEMP/diagnostic-key.hex"
+          openssl enc -aes-256-cbc -salt -pbkdf2 \
+            -in "$RUNNER_TEMP/private-catalog.log" \
+            -out "$RUNNER_TEMP/private-catalog.log.enc" \
+            -pass file:"$RUNNER_TEMP/diagnostic-key.hex"
+          openssl pkeyutl -encrypt -pubin \
+            -inkey "$RUNNER_TEMP/diagnostic-public.pem" \
+            -in "$RUNNER_TEMP/diagnostic-key.hex" \
+            -out "$RUNNER_TEMP/diagnostic-key.enc" \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          rm -f "$RUNNER_TEMP/diagnostic-key.hex" \
+            "$RUNNER_TEMP/diagnostic-public.pem" \
+            "$RUNNER_TEMP/private-catalog.log"
+
+      - name: Upload encrypted catalog diagnostics
+        if: steps.prepare.outcome == 'failure'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: encrypted-private-catalog-diagnostics
+          path: |
+            ${{ runner.temp }}/private-catalog.log.enc
+            ${{ runner.temp }}/diagnostic-key.enc
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove private catalog diagnostics
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/private-catalog.log"
+
+      - name: Report private catalog failure
+        if: steps.prepare.outcome == 'failure'
+        run: exit 1
+

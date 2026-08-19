@@ -1,0 +1,8 @@
+*.mobileprovision
+*.p12
+*.p8
+*.pem
+*.log
+*.log.enc
+diagnostic-key.enc
+
