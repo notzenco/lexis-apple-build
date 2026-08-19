@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   archive-and-upload:
-    runs-on: xcode-27
+    runs-on: macos-26
     timeout-minutes: 50
 
     steps:
@@ -97,13 +97,9 @@ jobs:
           xcodebuild -version
           developer_dir="$(xcode-select -p)"
           case "$developer_dir" in
-            *Xcode_27_beta_1.app/*|*Xcode_27_beta_2.app/*|*Xcode_27_beta_3.app/*)
-              echo "::error::App Store Connect no longer accepts this Xcode image."
-              exit 1
-              ;;
-            *Xcode_27*) ;;
+            *Xcode_26.6.app/*|*Xcode_26.6.0.app/*) ;;
             *)
-              echo "::error::Expected an Xcode 27 runner."
+              echo "::error::Expected the stable Xcode 26.6 release runner."
               exit 1
               ;;
           esac

@@ -13,8 +13,9 @@ one-day encrypted artifacts instead.
 
 - **Private source build** runs catalog validation, shared tests, and unsigned
   iPhone, Watch, iPhone-widget, and Watch-widget builds.
-- **TestFlight** validates signing profiles and embedded entitlements, archives
-  an exact source commit, and uploads a caller-supplied build number.
+- **TestFlight** uses the stable Xcode 26.6 release runner, validates signing
+  profiles and embedded entitlements, archives an exact source commit, and
+  uploads a caller-supplied build number.
 - **Catalog release** signs and publishes the stable public catalog assets
   consumed by Lexis.
 
@@ -22,4 +23,3 @@ Operational setup and migration order are documented in the private source
 repository at `docs/private-repository-delivery.md`. Never add application
 source, signing assets, decrypted diagnostics, tester data, or secret values to
 this repository.
-
