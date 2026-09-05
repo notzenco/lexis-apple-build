@@ -1,0 +1,196 @@
+# Prepared for one-off use; dispatch only after release coordinator review.
+# Intended repository: notzenco/lexis-apple-build (existing release secrets).
+# Private input: exact commit in notzenco/lexis-apple containing only the reviewed
+# transfer file at audit-transfer/Axio-Capture.app.tar.gz. A temporary transfer
+# branch/commit must be prepared and approved separately; no public release needed.
+name: Capture Intel and disk image notarization
+on:
+  workflow_dispatch:
+    inputs:
+      transfer_sha:
+        description: Exact private transfer commit (40 lowercase hex characters)
+        required: true
+        type: string
+      result_public_key:
+        description: One-off RSA public PEM for encrypted result return (never a private key)
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: axio-capture-packaging-notarization
+  cancel-in-progress: false
+jobs:
+  notarize:
+    runs-on: macos-26
+    timeout-minutes: 55
+    steps:
+      - name: Validate exact transfer reference
+        shell: bash
+        env:
+          TRANSFER_SHA: ${{ inputs.transfer_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$TRANSFER_SHA" =~ ^[0-9a-f]{40}$ ]]
+      - name: Retrieve private signed artifact
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: notzenco/lexis-apple
+          ref: ${{ inputs.transfer_sha }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          show-progress: false
+          sparse-checkout: audit-transfer
+          path: transfer
+      - name: Validate result encryption recipient before Apple submission
+        shell: bash
+        env:
+          RESULT_PUBLIC_KEY: ${{ inputs.result_public_key }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$RESULT_PUBLIC_KEY" > "$RUNNER_TEMP/capture-public.pem"
+          openssl pkey -pubin -in "$RUNNER_TEMP/capture-public.pem" -pubcheck -noout
+          openssl rsa -pubin -in "$RUNNER_TEMP/capture-public.pem" -noout
+          openssl rand 64 > "$RUNNER_TEMP/capture-probe.bin"
+          openssl pkeyutl -encrypt -pubin -inkey "$RUNNER_TEMP/capture-public.pem" \
+            -in "$RUNNER_TEMP/capture-probe.bin" -out "$RUNNER_TEMP/capture-probe.enc" \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          rm -f "$RUNNER_TEMP/capture-probe.bin" "$RUNNER_TEMP/capture-probe.enc"
+      - name: Verify fixed signed inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/capture-results" "$RUNNER_TEMP/capture-app"
+          exec >"$RUNNER_TEMP/capture-results/preflight.log" 2>&1
+          input="$GITHUB_WORKSPACE/transfer/audit-transfer"
+          verify() { [[ "$(shasum -a 256 "$input/$1" | awk '{print $1}')" == "$2" ]]; }
+          verify Axio-Capture-0.1.1-x86_64.app.tar.gz 786d26f354b1c9f80680ae611a4189238d55503bf69af7010b59b017fe89fd42
+          verify Axio-Capture-0.1.1-x86_64.dmg d30667dd4447197a2bf7b5af60668e83464c60e6aa285ac34ce660f660d2e973
+          verify Axio-Capture-0.1.1-aarch64.dmg a127483b665a752396ec89309a27e1931f319fac4adb2bed7813efc81837d9d8
+          tar -xzf "$input/Axio-Capture-0.1.1-x86_64.app.tar.gz" -C "$RUNNER_TEMP/capture-app"
+          app="$RUNNER_TEMP/capture-app/Axio Capture.app"
+          [[ "$(lipo -archs "$app/Contents/MacOS/axio-capture")" == x86_64 ]]
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$app/Contents/Info.plist")" == me.umbra.axio-capture ]]
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$app/Contents/Info.plist")" == 0.1.1 ]]
+          for item in "$app" "$input/Axio-Capture-0.1.1-x86_64.dmg" "$input/Axio-Capture-0.1.1-aarch64.dmg"; do
+            codesign --verify --deep --strict --verbose=2 "$item"
+            codesign -dvv "$item" 2> "$RUNNER_TEMP/signature.txt"
+            grep -qx 'TeamIdentifier=N7447R8KW2' "$RUNNER_TEMP/signature.txt"
+            grep -q '^Authority=Developer ID Application:' "$RUNNER_TEMP/signature.txt"
+          done
+          codesign -dvv "$app" 2> "$RUNNER_TEMP/capture-results/intel-signature.txt"
+          grep -q 'flags=.*runtime' "$RUNNER_TEMP/capture-results/intel-signature.txt"
+          ditto -c -k --keepParent "$app" "$RUNNER_TEMP/capture-submit.zip"
+          cp "$input/Axio-Capture-0.1.1-x86_64.dmg" "$RUNNER_TEMP/capture-results/"
+          cp "$input/Axio-Capture-0.1.1-aarch64.dmg" "$RUNNER_TEMP/capture-results/"
+      - name: Submit three fixed artifacts and preserve decisions
+        shell: bash
+        env:
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$APP_STORE_CONNECT_API_KEY"
+          test -n "$APP_STORE_CONNECT_API_KEY_ID"
+          test -n "$APP_STORE_CONNECT_ISSUER_ID"
+          auth_key="$RUNNER_TEMP/capture-auth.p8"
+          trap 'rm -f "$auth_key"' EXIT
+          printf '%s' "$APP_STORE_CONNECT_API_KEY" > "$auth_key"
+          auth=(--key "$auth_key" --key-id "$APP_STORE_CONNECT_API_KEY_ID" --issuer "$APP_STORE_CONNECT_ISSUER_ID")
+          submit() {
+            label="$1"; artifact="$2"
+            set +e
+            xcrun notarytool submit "$artifact" "${auth[@]}" --wait --timeout 15m --output-format json \
+              > "$RUNNER_TEMP/capture-results/$label-submit.json" 2> "$RUNNER_TEMP/capture-results/$label-stderr.log"
+            status=$?
+            set -e
+            printf '%s\n' "$status" > "$RUNNER_TEMP/capture-results/$label-exit.txt"
+            submission_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("id", ""))' "$RUNNER_TEMP/capture-results/$label-submit.json" 2>/dev/null || true)
+            if [[ -n "$submission_id" ]]; then
+              xcrun notarytool log "$submission_id" "${auth[@]}" "$RUNNER_TEMP/capture-results/$label-log.json" \
+                > "$RUNNER_TEMP/capture-results/$label-log-request.log" 2>&1 || true
+            fi
+            # Stop on uncertainty; Apple may still process it. Never automatically resubmit.
+            [[ "$status" == 0 ]]
+            python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["status"] == "Accepted"' "$RUNNER_TEMP/capture-results/$label-submit.json"
+          }
+          submit intel-app "$RUNNER_TEMP/capture-submit.zip"
+          submit intel-dmg "$RUNNER_TEMP/capture-results/Axio-Capture-0.1.1-x86_64.dmg"
+          submit arm64-dmg "$RUNNER_TEMP/capture-results/Axio-Capture-0.1.1-aarch64.dmg"
+      - name: Staple and validate accepted application and disk images
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec >"$RUNNER_TEMP/capture-results/acceptance.log" 2>&1
+          app="$RUNNER_TEMP/capture-app/Axio Capture.app"
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          spctl --assess --type execute --verbose=4 "$app"
+          for dmg in "$RUNNER_TEMP/capture-results/"*.dmg; do
+            xcrun stapler staple "$dmg"
+            xcrun stapler validate "$dmg"
+            codesign --verify --strict --verbose=2 "$dmg"
+            spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg"
+          done
+          tar -czf "$RUNNER_TEMP/capture-results/Axio-Capture-stapled-x86_64.app.tar.gz" -C "$RUNNER_TEMP/capture-app" 'Axio Capture.app'
+          shasum -a 256 "$RUNNER_TEMP/capture-results/"*.dmg "$RUNNER_TEMP/capture-results/"*.tar.gz > "$RUNNER_TEMP/capture-results/SHA256SUMS"
+      - name: Encrypt result and private diagnostics
+        id: encrypt_result
+        if: always()
+        shell: bash
+        env:
+          DIAGNOSTIC_PUBLIC_KEY: ${{ inputs.result_public_key }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$DIAGNOSTIC_PUBLIC_KEY"
+          mkdir -p "$RUNNER_TEMP/capture-results" "$RUNNER_TEMP/capture-encrypted"
+          tar -czf "$RUNNER_TEMP/capture-results.tar.gz" -C "$RUNNER_TEMP" capture-results
+          printf '%s' "$DIAGNOSTIC_PUBLIC_KEY" > "$RUNNER_TEMP/capture-public.pem"
+          python3 - <<'PYKEY'
+          import json, os, secrets
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          keys = {'encryption': secrets.token_hex(32), 'authentication': secrets.token_hex(32)}
+          (root / 'capture-keys.json').write_text(json.dumps(keys))
+          (root / 'capture-key.hex').write_text(keys['encryption'])
+          PYKEY
+          openssl enc -aes-256-cbc -salt -pbkdf2 \
+            -in "$RUNNER_TEMP/capture-results.tar.gz" \
+            -out "$RUNNER_TEMP/capture-encrypted/results.tar.gz.enc" \
+            -pass file:"$RUNNER_TEMP/capture-key.hex"
+          openssl pkeyutl -encrypt -pubin -inkey "$RUNNER_TEMP/capture-public.pem" \
+            -in "$RUNNER_TEMP/capture-keys.json" \
+            -out "$RUNNER_TEMP/capture-encrypted/key.enc" \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          python3 - <<'PYMAC'
+          import hashlib, hmac, json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          keys = json.loads((root / 'capture-keys.json').read_text())
+          data = (root / 'capture-encrypted/results.tar.gz.enc').read_bytes()
+          tag = hmac.new(bytes.fromhex(keys['authentication']), data, hashlib.sha256).hexdigest()
+          (root / 'capture-encrypted/results.hmac-sha256').write_text(tag + '\n')
+          PYMAC
+      - name: Preserve encrypted result for owner retrieval
+        id: encrypted_result
+        if: always() && steps.encrypt_result.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: capture-notarization-encrypted-result
+          path: ${{ runner.temp }}/capture-encrypted/
+          if-no-files-found: error
+          retention-days: 1
+      - name: Remove plaintext only after encrypted artifact upload succeeds
+        if: always() && steps.encrypted_result.outcome == 'success'
+        shell: bash
+        run: |
+          rm -f "$RUNNER_TEMP/capture-auth.p8" "$RUNNER_TEMP/capture-public.pem" \
+            "$RUNNER_TEMP/capture-key.hex" "$RUNNER_TEMP/capture-keys.json" "$RUNNER_TEMP/capture-submit.zip" \
+            "$RUNNER_TEMP/capture-results.tar.gz"
+          rm -rf "$RUNNER_TEMP/capture-results" "$RUNNER_TEMP/capture-app" "$GITHUB_WORKSPACE/transfer"
