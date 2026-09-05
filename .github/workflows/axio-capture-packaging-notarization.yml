@@ -137,7 +137,7 @@ jobs:
             codesign --verify --strict --verbose=2 "$dmg"
             spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg"
           done
-          tar -czf "$RUNNER_TEMP/capture-results/Axio-Capture-stapled-x86_64.app.tar.gz" -C "$RUNNER_TEMP/capture-app" 'Axio Capture.app'
+          COPYFILE_DISABLE=1 tar -czf "$RUNNER_TEMP/capture-results/Axio-Capture-stapled-x86_64.app.tar.gz" -C "$RUNNER_TEMP/capture-app" 'Axio Capture.app'
           shasum -a 256 "$RUNNER_TEMP/capture-results/"*.dmg "$RUNNER_TEMP/capture-results/"*.tar.gz > "$RUNNER_TEMP/capture-results/SHA256SUMS"
       - name: Encrypt result and private diagnostics
         id: encrypt_result

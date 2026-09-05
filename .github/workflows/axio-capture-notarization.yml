@@ -123,7 +123,7 @@ jobs:
           xcrun stapler validate "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
           spctl --assess --type execute --verbose=4 "$app"
-          tar -czf "$RUNNER_TEMP/capture-results/Axio-Capture-stapled.app.tar.gz" \
+          COPYFILE_DISABLE=1 tar -czf "$RUNNER_TEMP/capture-results/Axio-Capture-stapled.app.tar.gz" \
             -C "$RUNNER_TEMP/capture-app" 'Axio Capture.app'
           shasum -a 256 "$RUNNER_TEMP/capture-results/Axio-Capture-stapled.app.tar.gz" \
             > "$RUNNER_TEMP/capture-results/stapled-sha256.txt"
