@@ -28,7 +28,12 @@ export function createClient(env, fetchImpl = fetch) {
       signal: AbortSignal.timeout(30000),
       redirect: 'error',
     });
-    if (!response.ok) throw new ReleaseError(`App Store Connect returned HTTP ${response.status}.`);
+    if (!response.ok) {
+      const errors = await response.json().catch(() => ({}));
+      const codes = (errors.errors ?? []).map(error => error.code).filter(code => typeof code === 'string' && /^[A-Z][A-Z0-9_.-]{0,100}$/.test(code));
+      const operation = url.pathname.replace(/\/[^/]+(?=\/(?:relationships|betaBuildLocalizations|buildBetaDetail)|$)/g, '/resource');
+      throw new ReleaseError(`App Store Connect returned HTTP ${response.status} for ${method} ${operation}${codes.length ? ` (${codes.join(', ')})` : ''}.`);
+    }
     return response.status === 204 ? undefined : response.json();
   };
 }
@@ -66,7 +71,7 @@ export async function context(api, bundleID) {
   const groups = await list(api, `/v1/apps/${app.id}/betaGroups?limit=200`);
   const matches = groups.filter(group => group.attributes.name === groupName && group.attributes.isInternalGroup === true);
   if (matches.length !== 1) throw new ReleaseError('Expected the existing internal Personal Testing group.');
-  return { appID: app.id, groupID: matches[0].id };
+  return { appID: app.id, groupID: matches[0].id, hasAccessToAllBuilds: matches[0].attributes.hasAccessToAllBuilds === true };
 }
 
 export async function preflight(api, env) {
@@ -82,7 +87,7 @@ export async function preflight(api, env) {
 export async function distribute(api, env, options = {}) {
   if (!/^[1-9]\d*$/.test(env.BUILD_NUMBER ?? '')) throw new ReleaseError('Expected a positive integer BUILD_NUMBER.');
   if (!env.TESTFLIGHT_WHAT_TO_TEST?.trim() || env.TESTFLIGHT_WHAT_TO_TEST.length > 4000) throw new ReleaseError('Expected bounded public TestFlight notes.');
-  const { appID, groupID } = await context(api, env.IOS_BUNDLE_ID);
+  const { appID, groupID, hasAccessToAllBuilds } = await context(api, env.IOS_BUNDLE_ID);
   const sleep = options.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
   const now = options.now ?? Date.now;
   const deadline = now() + (options.timeoutMs ?? 25 * 60 * 1000);
@@ -109,7 +114,7 @@ export async function distribute(api, env, options = {}) {
     await api('/v1/betaBuildLocalizations', 'POST', { data: { type: 'betaBuildLocalizations', attributes: { locale: 'en-US', ...attributes }, relationships: { build: { data: { type: 'builds', id: build.id } } } } });
   }
   let groupBuilds = await list(api, `/v1/betaGroups/${groupID}/relationships/builds?limit=200`);
-  if (!groupBuilds.some(item => item.id === build.id)) {
+  if (!hasAccessToAllBuilds && !groupBuilds.some(item => item.id === build.id)) {
     await api(`/v1/betaGroups/${groupID}/relationships/builds`, 'POST', { data: [{ type: 'builds', id: build.id }] });
   }
   while (now() < deadline) {

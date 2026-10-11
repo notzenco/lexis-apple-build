@@ -1,0 +1,39 @@
+name: TestFlight availability
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: Existing uploaded Lexis build number
+        required: true
+      what_to_test:
+        description: Public TestFlight test notes
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lexis-testflight
+  cancel-in-progress: false
+
+jobs:
+  verify-existing-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out release orchestration
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Test release verification
+        run: node --test tools/testflight-distribution.test.mjs
+      - name: Verify existing build and internal availability
+        env:
+          BUILD_NUMBER: ${{ inputs.build_number }}
+          IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+          TESTFLIGHT_WHAT_TO_TEST: ${{ inputs.what_to_test }}
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: node tools/testflight-distribution.mjs distribute

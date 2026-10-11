@@ -22,6 +22,9 @@ one-day encrypted artifacts instead.
   inspecting the existing upload before retrying; it is not a failed upload.
   App Store Connect API requests use the existing encrypted workflow key and
   never print credentials, tester identities, or raw provider diagnostics.
+- **TestFlight availability** resumes processing, test notes, and internal
+  group verification for an existing upload without archiving or uploading
+  another build. Use it after an uncertain processing or assignment result.
 - **Catalog release** signs and publishes the stable public catalog assets
   consumed by Lexis.
 
