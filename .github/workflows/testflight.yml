@@ -9,6 +9,9 @@ on:
       build_number:
         description: App Store Connect build number, greater than every prior Lexis build
         required: true
+      what_to_test:
+        description: Public TestFlight test notes
+        required: true
 
 permissions:
   contents: read
@@ -32,6 +35,24 @@ jobs:
           set -euo pipefail
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]]
+
+      - name: Check out release orchestration
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          path: orchestration
+
+      - name: Verify unused build number and existing internal group
+        shell: bash
+        env:
+          BUILD_NUMBER: ${{ inputs.build_number }}
+          IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          node --test orchestration/tools/testflight-distribution.test.mjs
+          node orchestration/tools/testflight-distribution.mjs preflight
 
       - name: Check out private source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -370,6 +391,18 @@ jobs:
             echo "::error::The private App Store Connect upload failed. Diagnostics are suppressed here."
             exit 1
           fi
+
+      - name: Verify processing and Personal Testing availability
+        if: steps.release.outcome == 'success' && steps.export.outcome == 'success' && steps.upload.outcome == 'success'
+        shell: bash
+        env:
+          BUILD_NUMBER: ${{ inputs.build_number }}
+          IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+          TESTFLIGHT_WHAT_TO_TEST: ${{ inputs.what_to_test }}
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: node orchestration/tools/testflight-distribution.mjs distribute
 
       - name: Encrypt private release diagnostics
         if: steps.release.outcome == 'failure' || steps.export.outcome == 'failure' || steps.upload.outcome == 'failure'

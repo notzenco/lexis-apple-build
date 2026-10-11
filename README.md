@@ -15,7 +15,13 @@ one-day encrypted artifacts instead.
   iPhone, Watch, iPhone-widget, and Watch-widget builds.
 - **TestFlight** uses the stable Xcode 26.6 release runner, validates signing
   profiles and embedded entitlements, archives an exact source commit, and
-  uploads a caller-supplied build number.
+  checks the caller-supplied build number against every existing upload, then
+  uploads it. It waits for Apple processing, publishes the supplied public test
+  notes, and verifies that the existing internal Personal Testing group has
+  access and the build is in beta testing. A processing timeout requires
+  inspecting the existing upload before retrying; it is not a failed upload.
+  App Store Connect API requests use the existing encrypted workflow key and
+  never print credentials, tester identities, or raw provider diagnostics.
 - **Catalog release** signs and publishes the stable public catalog assets
   consumed by Lexis.
 
