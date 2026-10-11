@@ -43,6 +43,7 @@ test('valid build gets notes and existing internal access, verified by readback'
   assert.match(await distribute(f.api, env), /IN_BETA_TESTING/);
   const changes = f.requests.filter(request => request.method !== 'GET');
   assert.equal(changes.length, 2);
+  assert.deepEqual(changes[0].body.data.attributes, { locale: 'en-US', whatsNew: env.TESTFLIGHT_WHAT_TO_TEST });
   assert.deepEqual(changes[1].body, { data: [{ type: 'builds', id: 'build' }] });
   assert.equal(changes[1].path, '/v1/betaGroups/internal/relationships/builds');
 });
@@ -81,5 +82,5 @@ test('JWT signature is ES256 and API credentials cannot follow pagination off-or
 test('provider diagnostics are suppressed even when an API error contains secrets', async () => {
   const { privateKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
   const api = createClient({ APP_STORE_CONNECT_API_KEY: privateKey, APP_STORE_CONNECT_API_KEY_ID: 'test-key', APP_STORE_CONNECT_ISSUER_ID: 'test-issuer' }, async () => new Response('secret-provider-diagnostic', { status: 403 }));
-  await assert.rejects(api('/v1/apps'), error => error.message === 'App Store Connect returned HTTP 403 for GET /v1/resource.');
+  await assert.rejects(api('/v1/apps'), error => error.message === 'App Store Connect returned HTTP 403 for GET /v1/apps.');
 });

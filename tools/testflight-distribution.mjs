@@ -31,7 +31,7 @@ export function createClient(env, fetchImpl = fetch) {
     if (!response.ok) {
       const errors = await response.json().catch(() => ({}));
       const codes = (errors.errors ?? []).map(error => error.code).filter(code => typeof code === 'string' && /^[A-Z][A-Z0-9_.-]{0,100}$/.test(code));
-      const operation = url.pathname.replace(/\/[^/]+(?=\/(?:relationships|betaBuildLocalizations|buildBetaDetail)|$)/g, '/resource');
+      const operation = url.pathname.replace(/\/[a-f0-9-]{8,}(?=\/|$)/ig, '/resource');
       throw new ReleaseError(`App Store Connect returned HTTP ${response.status} for ${method} ${operation}${codes.length ? ` (${codes.join(', ')})` : ''}.`);
     }
     return response.status === 204 ? undefined : response.json();
@@ -107,7 +107,7 @@ export async function distribute(api, env, options = {}) {
   if (build.attributes.expired) throw new ReleaseError('The uploaded build is expired.');
   const locales = await list(api, `/v1/builds/${build.id}/betaBuildLocalizations?limit=200`);
   const existing = locales.find(locale => locale.attributes.locale === 'en-US');
-  const attributes = { whatToTest: env.TESTFLIGHT_WHAT_TO_TEST };
+  const attributes = { whatsNew: env.TESTFLIGHT_WHAT_TO_TEST };
   if (existing) {
     await api(`/v1/betaBuildLocalizations/${existing.id}`, 'PATCH', { data: { type: 'betaBuildLocalizations', id: existing.id, attributes } });
   } else {
@@ -122,7 +122,7 @@ export async function distribute(api, env, options = {}) {
     const detail = await api(`/v1/builds/${build.id}/buildBetaDetail`);
     if (groupBuilds.some(item => item.id === build.id) && detail.data.attributes.internalBuildState === 'IN_BETA_TESTING') {
       const notes = await list(api, `/v1/builds/${build.id}/betaBuildLocalizations?limit=200`);
-      if (!notes.some(locale => locale.attributes.locale === 'en-US' && locale.attributes.whatToTest === env.TESTFLIGHT_WHAT_TO_TEST)) throw new ReleaseError('TestFlight notes did not match after publication.');
+      if (!notes.some(locale => locale.attributes.locale === 'en-US' && locale.attributes.whatsNew === env.TESTFLIGHT_WHAT_TO_TEST)) throw new ReleaseError('TestFlight notes did not match after publication.');
       return `Build ${env.BUILD_NUMBER}: processing VALID, Personal Testing assigned, internal state IN_BETA_TESTING, test notes verified.`;
     }
     console.log('Waiting for internal TestFlight availability.');
